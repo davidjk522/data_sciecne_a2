@@ -55,7 +55,7 @@ def _cosine_sim(vectors, index):
     return pd.DataFrame(sim_matrix, index=index, columns=index)
 
 
-def compute_svd_similarity(user_item_table, global_mean, user_bias, item_bias, k=20, n_iter=10):
+def compute_svd_similarity(user_item_table, global_mean, user_bias, item_bias, latent_k=50, n_iter=10):
     """
     Iterative SVD로 user/item latent vector를 추출하고 PCC 유사도를 반환한다.
 
@@ -88,7 +88,7 @@ def compute_svd_similarity(user_item_table, global_mean, user_bias, item_bias, k
         U, S, Vt = np.linalg.svd(filled, full_matrices=False)
         # 상위 k개의 singular value/vector만 사용해 low-rank 근사 행렬을 재구성한다
         # k가 클수록 정확하지만 노이즈도 포함될 수 있다
-        reconstructed = U[:, :k] @ np.diag(S[:k]) @ Vt[:k, :]
+        reconstructed = U[:, :latent_k] @ np.diag(S[:latent_k]) @ Vt[:latent_k, :]
         # 실제 평가 위치는 원본 유지, missing value 위치만 재구성값으로 업데이트
         # 반복할수록 missing value 추정이 점점 정확해진다
         filled = np.where(known_mask, known_values, reconstructed)
@@ -105,12 +105,12 @@ def compute_svd_similarity(user_item_table, global_mean, user_bias, item_bias, k
     #
     # 두 벡터를 내적하면 원래 SVD 근사가 복원된다:
     # user_vectors @ item_vectors.T = U @ diag(S) @ Vt ≈ A
-    sqrt_s = np.sqrt(S[:k])
+    sqrt_s = np.sqrt(S[:latent_k])
 
     # user latent vector: (n_users, k) — 각 user의 잠재 선호도 표현
-    user_vectors = U[:, :k] * sqrt_s
+    user_vectors = U[:, :latent_k] * sqrt_s
     # item latent vector: (n_items, k) — 각 item의 잠재 특성 표현
-    item_vectors = (Vt[:k, :] * sqrt_s[:, None]).T
+    item_vectors = (Vt[:latent_k, :] * sqrt_s[:, None]).T
 
     # latent vector 간 코사인 유사도로 user-user / item-item 유사도 행렬을 만든다
     # 잠재 공간에서 유사도를 계산하므로 원본 행렬의 희소성(sparsity)에 강하다
@@ -118,7 +118,7 @@ def compute_svd_similarity(user_item_table, global_mean, user_bias, item_bias, k
     item_sim = _cosine_sim(item_vectors, items)
 
     # 최종 재구성 행렬: MF 예측값으로 직접 사용한다 (rating 범위 [1,5]로 클리핑)
-    reconstructed = np.clip(U[:, :k] @ np.diag(S[:k]) @ Vt[:k, :], 1.0, 5.0)
+    reconstructed = np.clip(U[:, :latent_k] @ np.diag(S[:latent_k]) @ Vt[:latent_k, :], 1.0, 5.0)
     recon_df = pd.DataFrame(reconstructed, index=users, columns=items)
 
     return user_sim, item_sim, recon_df
@@ -251,20 +251,102 @@ def predict_rating_item(user_id, item_id, user_item_table, item_sim,
     return float(np.clip(pred, 1.0, 5.0))
 
 
-def predict_rating_svd(user_id, item_id, recon_df, global_mean, user_bias, item_bias):
+def train_svdpp(train_data, global_mean, k=20, lr=0.007, reg=0.02, n_epochs=20):
     """
-    SVD 재구성 행렬에서 직접 예측값을 읽는다.
-    학습 데이터에 없는 user/item은 baseline으로 fallback한다.
+    SVD++ 모델을 SGD로 학습한다.
+
+    기본 MF에 implicit feedback(user가 item을 평가했다는 사실 자체)을 추가한다.
+
+    예측 공식:
+      r̂(u,i) = μ + b_u + b_i + q_i^T * (p_u + |N(u)|^(-1/2) * Σ_{j∈N(u)} y_j)
+
+      p_u : user latent factor — user의 명시적 선호도
+      q_i : item latent factor — item의 잠재 특성
+      y_j : implicit item factor — j를 평가했다는 행동 자체가 담긴 선호도 신호
+      N(u): user u가 평가한 전체 item 집합
     """
-    # recon_df는 iterative SVD의 최종 재구성 행렬로
-    # 전체 행렬 구조의 잠재 패턴을 반영한 전역적(global) 예측값이다
-    # CF가 이웃 부족으로 예측이 약할 때 이를 보완하는 역할을 한다
-    if user_id in recon_df.index and item_id in recon_df.columns:
-        return float(recon_df.loc[user_id, item_id])
-    # 학습 데이터에 없는 경우 baseline으로 fallback
-    b_u = user_bias.get(user_id, 0.0)
-    b_i = item_bias.get(item_id, 0.0)
-    return float(np.clip(global_mean + b_u + b_i, 1.0, 5.0))
+    users = train_data['user_id'].unique()
+    items = train_data['item_id'].unique()
+
+    # user/item ID → 정수 인덱스 매핑
+    user_idx = {u: i for i, u in enumerate(users)}
+    item_idx = {it: i for i, it in enumerate(items)}
+
+    n_users, n_items = len(users), len(items)
+
+    # 파라미터 초기화 (작은 난수로 symmetry breaking)
+    P = np.random.normal(0, 0.01, (n_users, k))  # user latent factors
+    Q = np.random.normal(0, 0.01, (n_items, k))  # item latent factors
+    Y = np.zeros((n_items, k))                    # implicit item factors
+    bu = np.zeros(n_users)                         # user bias
+    bi = np.zeros(n_items)                         # item bias
+
+    # user별 평가한 item의 인덱스 배열 (implicit feedback 집합 N(u))
+    user_items_idx = {}
+    for u_id, group in train_data.groupby('user_id'):
+        idxs = [item_idx[it] for it in group['item_id'] if it in item_idx]
+        user_items_idx[user_idx[u_id]] = np.array(idxs, dtype=int)
+
+    # 학습 데이터를 (user_idx, item_idx, rating) 배열로 변환
+    u_arr = train_data['user_id'].map(user_idx).values
+    i_arr = train_data['item_id'].map(item_idx).values
+    r_arr = train_data['rating'].values
+    ratings = np.column_stack([u_arr, i_arr, r_arr])
+
+    for epoch in range(n_epochs):
+        np.random.shuffle(ratings)
+        for u, i, r in ratings:
+            u, i = int(u), int(i)
+
+            # implicit feedback: user u가 평가한 item들의 y_j 합산
+            Nu = user_items_idx.get(u, np.array([], dtype=int))
+            sqrt_Nu = len(Nu) ** -0.5 if len(Nu) > 0 else 0.0
+            implicit = sqrt_Nu * Y[Nu].sum(axis=0) if len(Nu) > 0 else np.zeros(k)
+
+            # 예측 및 오차 계산
+            pred = global_mean + bu[u] + bi[i] + Q[i] @ (P[u] + implicit)
+            e = r - pred
+
+            # bias 업데이트
+            bu[u] += lr * (e - reg * bu[u])
+            bi[i] += lr * (e - reg * bi[i])
+
+            # latent factor 업데이트
+            # Q[i] 업데이트 전에 복사해두어 P, Y 업데이트에 이전 값을 사용한다
+            Qi_old = Q[i].copy()
+            Q[i] += lr * (e * (P[u] + implicit) - reg * Q[i])
+            P[u] += lr * (e * Qi_old - reg * P[u])
+
+            # implicit factor 업데이트 (numpy 슬라이싱으로 N(u) 전체를 한 번에 처리)
+            if len(Nu) > 0:
+                Y[Nu] += lr * (e * sqrt_Nu * Qi_old - reg * Y[Nu])
+
+        print(f" epoch {epoch + 1}/{n_epochs}")
+
+    return P, Q, Y, bu, bi, user_idx, item_idx, user_items_idx
+
+
+def predict_svdpp(user_id, item_id, P, Q, Y, bu, bi,
+                  user_idx, item_idx, user_items_idx, global_mean, k):
+    """
+    SVD++ 모델로 (user_id, item_id) 쌍의 rating을 예측한다.
+    학습 데이터에 없는 user/item은 bias만으로 fallback한다.
+    """
+    if user_id not in user_idx or item_id not in item_idx:
+        # cold start: 알 수 있는 bias만 반영
+        b_u = bu[user_idx[user_id]] if user_id in user_idx else 0.0
+        b_i = bi[item_idx[item_id]] if item_id in item_idx else 0.0
+        return float(np.clip(global_mean + b_u + b_i, 1.0, 5.0))
+
+    u = user_idx[user_id]
+    i = item_idx[item_id]
+
+    Nu = user_items_idx.get(u, np.array([], dtype=int))
+    sqrt_Nu = len(Nu) ** -0.5 if len(Nu) > 0 else 0.0
+    implicit = sqrt_Nu * Y[Nu].sum(axis=0) if len(Nu) > 0 else np.zeros(k)
+
+    pred = global_mean + bu[u] + bi[i] + Q[i] @ (P[u] + implicit)
+    return float(np.clip(pred, 1.0, 5.0))
 
 
 def compute_rmse(predictions, actuals):
@@ -294,21 +376,48 @@ def main():
     # global_mean: 전체 평균 rating (cold-start fallback의 최후 수단)
     global_mean = train_data['rating'].mean()
 
+    # --- 하이퍼파라미터 설정 ---
+    latent_k      = 50    # SVD 잠재 요인 수 (클수록 표현력 증가, 노이즈 위험 증가)
+    n_iter        = 10    # Iterative SVD 반복 횟수 (클수록 missing value 추정 정확)
+    lambda_u      = 25    # user bias 정규화 강도 (클수록 bias가 0으로 수축)
+    lambda_i      = 25    # item bias 정규화 강도
+    k_neighbor    = 30    # CF에서 참고할 이웃 수 (user-based, item-based 공통)
+    svdpp_k       = 20    # SVD++ 잠재 요인 수
+    svdpp_lr      = 0.007 # SVD++ SGD 학습률
+    svdpp_reg     = 0.02  # SVD++ 정규화 강도
+    svdpp_epochs  = 20    # SVD++ 학습 epoch 수
+    alpha         = 0.20  # 앙상블 가중치: user-based CF
+    beta          = 0.40  # 앙상블 가중치: item-based CF
+    gamma         = 0.40  # 앙상블 가중치: SVD++ (alpha+beta+gamma = 1.0)
+
+    print(f"  latent_k     : {latent_k}    (number of SVD latent factors)")
+    print(f"  n_iter       : {n_iter}    (number of iterative SVD iterations)")
+    print(f"  lambda_u     : {lambda_u}    (user bias regularization strength)")
+    print(f"  lambda_i     : {lambda_i}    (item bias regularization strength)")
+    print(f"  k_neighbor   : {k_neighbor}    (number of CF neighbors)")
+    print(f"  svdpp_k      : {svdpp_k}    (number of SVD++ latent factors)")
+    print(f"  svdpp_lr     : {svdpp_lr}  (SVD++ learning rate)")
+    print(f"  svdpp_reg    : {svdpp_reg}   (SVD++ regularization strength)")
+    print(f"  svdpp_epochs : {svdpp_epochs}    (SVD++ training epochs)")
+    print(f"  alpha        : {alpha}   (user-based CF weight)")
+    print(f"  beta         : {beta}   (item-based CF weight)")
+    print(f"  gamma        : {gamma}   (SVD++ weight)")
+
     # 정규화된 user/item bias 계산
     # bias는 SVD 결측 초기화와 CF 예측의 baseline에 모두 사용된다
-    user_bias, item_bias = compute_biases(train_data, global_mean)
+    user_bias, item_bias = compute_biases(train_data, global_mean, lambda_u, lambda_i)
 
-    print("Computing SVD")
-    # iterative SVD로 유사도 행렬(user_sim, item_sim)과 재구성 행렬(recon_df)을 동시에 생성
-    user_sim, item_sim, recon_df = compute_svd_similarity(user_item_table, global_mean, user_bias, item_bias)
+    print("Computing iterative SVD")
+    # iterative SVD로 유사도 행렬(user_sim, item_sim)을 생성 (CF에서 사용)
+    user_sim, item_sim, _ = compute_svd_similarity(
+        user_item_table, global_mean, user_bias, item_bias, latent_k, n_iter)
 
-    # 앙상블 가중치 (합 = 1.0)
-    # 세 예측값을 선형 결합해 최종 예측을 만든다
-    alpha = 0.25   # user-based CF
-    beta  = 0.45   # item-based CF
-    gamma = 0.30   # SVD 재구성
+    print("Training SVD++...")
+    # SVD++를 SGD로 학습하여 user/item latent factor와 implicit factor를 구한다
+    P, Q, Y, bu, bi, user_idx, item_idx, user_items_idx = train_svdpp(
+        train_data, global_mean, svdpp_k, svdpp_lr, svdpp_reg, svdpp_epochs)
 
-    print("Predicting ratings")
+    print("Predicting ratings...")
     output_file = train_file + '_prediction.txt'
     predictions = []
     with open(output_file, 'w') as f:
@@ -316,13 +425,14 @@ def main():
             uid = int(row['user_id'])
             iid = int(row['item_id'])
             # 세 가지 예측값을 각각 계산한다
-            pred_user = predict_rating(uid, iid, user_item_table, user_sim, user_means,
-                                       global_mean, user_bias, item_bias)
-            pred_item = predict_rating_item(uid, iid, user_item_table, item_sim,
-                                            global_mean, user_bias, item_bias)
-            pred_svd  = predict_rating_svd(uid, iid, recon_df, global_mean, user_bias, item_bias)
+            pred_user  = predict_rating(uid, iid, user_item_table, user_sim, user_means,
+                                        global_mean, user_bias, item_bias, k_neighbor)
+            pred_item  = predict_rating_item(uid, iid, user_item_table, item_sim,
+                                             global_mean, user_bias, item_bias, k_neighbor)
+            pred_svdpp = predict_svdpp(uid, iid, P, Q, Y, bu, bi,
+                                       user_idx, item_idx, user_items_idx, global_mean, svdpp_k)
             # 앙상블: 가중 평균으로 최종 예측값을 산출한다
-            pred = alpha * pred_user + beta * pred_item + gamma * pred_svd
+            pred = alpha * pred_user + beta * pred_item + gamma * pred_svdpp
             predictions.append((uid, iid, pred))
             f.write(f"{uid}\t{iid}\t{pred:.4f}\n")
 

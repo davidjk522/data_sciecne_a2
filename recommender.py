@@ -109,7 +109,7 @@ def compute_biases(train_data, global_mean, lambda_u=25, lambda_i=25):
 
 
 def predict_rating(user_id, item_id, user_item_table, similarity_df, user_means,
-                   global_mean, user_bias, item_bias, k=30):
+                   global_mean, user_bias, item_bias, k_neighbor=30):
     """
     Bias-corrected mean-centered user-based CF 예측.
     baseline(u, i) = global_mean + bias_u + bias_i 를 기준으로
@@ -133,7 +133,7 @@ def predict_rating(user_id, item_id, user_item_table, similarity_df, user_means,
         return float(np.clip(baseline_ui, 1.0, 5.0))
 
     sims = similarity_df.loc[user_id, raters]
-    top = sims[sims > 0].nlargest(k)
+    top = sims[sims > 0].nlargest(k_neighbor)
 
     if top.empty:
         return float(np.clip(baseline_ui, 1.0, 5.0))
@@ -153,7 +153,7 @@ def predict_rating(user_id, item_id, user_item_table, similarity_df, user_means,
 
 
 def predict_rating_item(user_id, item_id, user_item_table, item_sim,
-                        global_mean, user_bias, item_bias, k=30):
+                        global_mean, user_bias, item_bias, k_neighbor=30):
     """
     Item-based CF 예측.
     user_u가 평가한 아이템 중 item_i와 유사한 top-k를 찾아
@@ -175,7 +175,7 @@ def predict_rating_item(user_id, item_id, user_item_table, item_sim,
         return float(np.clip(baseline_ui, 1.0, 5.0))
 
     sims = item_sim.loc[item_id, rated_items]
-    top = sims[sims > 0].nlargest(k)
+    top = sims[sims > 0].nlargest(k_neighbor)
 
     if top.empty:
         return float(np.clip(baseline_ui, 1.0, 5.0))

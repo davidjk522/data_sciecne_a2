@@ -3,4 +3,5 @@
 
 # Except recommender.py
 !recommender.py
+!run_all.py
 !.gitignore
